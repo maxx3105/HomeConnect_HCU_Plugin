@@ -1,0 +1,25 @@
+{
+  "id": "de.eq3.homeconnect",
+  "name": "Home Connect",
+  "friendlyName": {
+    "de": "Home Connect",
+    "en": "Home Connect"
+  },
+  "description": {
+    "de": "Bindet Home Connect Geräte (Bosch, Siemens, Neff) in die HCU ein.",
+    "en": "Integrates Home Connect home appliances (Bosch, Siemens, Neff) into the HCU."
+  },
+  "version": "0.1.0",
+  "author": "community",
+  "license": "Apache-2.0",
+  "capabilities": [
+    "device.virtual",
+    "event.subscription",
+    "control.dispatch"
+  ],
+  "requiredAuthScopes": [
+    "plugin.device.manage",
+    "plugin.event.receive",
+    "plugin.control.receive"
+  ]
+}
