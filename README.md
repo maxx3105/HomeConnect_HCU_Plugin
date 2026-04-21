@@ -48,10 +48,9 @@ Gerät als virtuelles Gerät in der HCU ab.
 ## Installation
 
 ```bash
-git clone <dieses repo>
-cd hcu-homeconnect-plugin
+git clone https://github.com/maxx3105/HomeConnect_HCU_Plugin.git
+cd HomeConnect_HCU_Plugin
 npm install
-cp config.example.json config.json
 cp .env.example .env
 # .env mit HC Client ID/Secret und HCU-Verbindungsdaten füllen
 npm start
