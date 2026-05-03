@@ -1,10 +1,9 @@
-FROM --platform=linux/arm64 ghcr.io/homematicip/alpine-node-simple:0.0.1
+FROM node:20-alpine
 
 WORKDIR /app
 
 COPY package*.json .
-
-RUN npm install ws uuid
+RUN npm install ws uuid --omit=dev
 
 COPY plugin.js .
 
