@@ -81,15 +81,8 @@ export function itemsToStatusEvents(baseDeviceId, items) {
   for (const it of items ?? []) {
     switch (it.key) {
 
-      // Fernstart aktiv → dimLevel 100% + switch on
+      // Fernstart - ignorieren
       case "BSH.Common.Status.RemoteControlStartAllowed":
-        if (it.value === true || it.value === "true") {
-          lightFeatures.switchState = { type: "switchState", on: true };
-          lightFeatures.dimming     = { type: "dimming", dimLevel: 1.0 };
-        } else {
-          // Fernstart deaktiviert → nur dimLevel zurücksetzen wenn nicht läuft
-          lightFeatures.dimming = { type: "dimming", dimLevel: 0 };
-        }
         break;
 
       // Betriebszustand
@@ -108,9 +101,12 @@ export function itemsToStatusEvents(baseDeviceId, items) {
 
         if (running) {
           lightFeatures.switchState = { type: "switchState", on: true };
+          // dimLevel auf 1.0 setzen wenn Programm startet (falls noch kein Progress)
+          if (!lightFeatures.dimming) {
+            lightFeatures.dimming = { type: "dimming", dimLevel: 1.0 };
+          }
         } else if (ready) {
-          // Fertig/bereit - Switch bleibt on wenn Fernstart aktiv
-          // wird durch RemoteControlStartAllowed gesteuert
+          // Bereit/Inaktiv - nichts ändern
         } else {
           // Finished/Error/etc.
           lightFeatures.switchState = { type: "switchState", on: false };
