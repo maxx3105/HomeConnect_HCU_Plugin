@@ -88,7 +88,7 @@ function sendConfigTemplate(hcu, cfg, authState, correlationId) {
   }
 
   hcu.sendConfigTemplateResponse({
-    correlationId: null,
+    correlationId: correlationId,
     groups: {
       homeconnect: {
         friendlyName: "Home Connect API",
