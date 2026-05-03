@@ -54,8 +54,12 @@ export class HcuClient extends EventEmitter {
   }
 
   sendConfigTemplateResponse({ correlationId, groups, properties }) {
+    if (!correlationId) {
+      // Ohne Request keine Response senden
+      return;
+    }
     this.#send({
-      id: correlationId ?? undefined,
+      id: correlationId,
       pluginId: this.pluginId,
       type: MSG_OUT.CONFIG_TEMPLATE_RESPONSE,
       body: { groups, properties }

@@ -29,7 +29,7 @@ async function saveConfig(cfg) {
 }
 
 /** Sendet CONFIG_TEMPLATE_RESPONSE mit optionalem Auth-Status */
-function sendConfigTemplate(hcu, cfg, authState) {
+function sendConfigTemplate(hcu, cfg, authState, correlationId) {
   const properties = {
     hcClientId: {
       friendlyName:  "Client ID",
@@ -119,7 +119,7 @@ async function main() {
 
   hcu.on("config_template_request", ({ correlationId }) => {
     logger.info("Config-Template angefragt");
-    sendConfigTemplate(hcu, cfg, authState);
+    sendConfigTemplate(hcu, cfg, authState, correlationId);
   });
 
   hcu.on("config_update_request", async ({ correlationId, properties }) => {
