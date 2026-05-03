@@ -173,10 +173,9 @@ async function main() {
 
   // Callback: Code in Konfig-Ansicht anzeigen
   auth.onDeviceCode = ({ code, link, expires }) => {
-    logger.info({ code, link }, "Device Code erhalten - zeige in HCUweb");
+    logger.info({ code, link }, "Device Code erhalten - wird bei nächstem Config-Request angezeigt");
     authState = { code, link, expires };
-    // Neue Config-Template-Response pushen damit HCUweb Code anzeigt
-    sendConfigTemplate(hcu, cfg, authState);
+    // Kein unaufgefordertes Senden - HCU fragt selbst wenn Config-Seite geöffnet wird
   };
 
   await auth.init();
