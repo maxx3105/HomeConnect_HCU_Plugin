@@ -11,15 +11,16 @@ export class HomeConnectAuth {
     this.base         = overrideConfig.baseUrl      ?? config.homeConnect.baseUrl;
     this.clientId     = overrideConfig.clientId     ?? config.homeConnect.clientId;
     this.clientSecret = overrideConfig.clientSecret ?? config.homeConnect.clientSecret;
-    this.scopes       = overrideConfig.scopes       ?? null; // null = automatisch ermitteln
+    this.scopes       = overrideConfig.scopes       ?? null;
     this.tokenFile    = path.resolve(config.tokenStore);
     this.tokens       = null;
+    /** Callback: (code, link) → wird aufgerufen sobald Device Code bekannt */
+    this.onDeviceCode = null;
   }
 
   async init() {
     await this.#loadFromDisk();
     if (!this.tokens?.refresh_token) {
-      // Erst mit Minimal-Scope autorisieren
       await this.#performDeviceFlow(this.scopes ?? MINIMAL_SCOPE);
     }
     if (this.#accessTokenExpired()) {
@@ -27,19 +28,11 @@ export class HomeConnectAuth {
     }
   }
 
-  /**
-   * Scopes upgraden nachdem Geräte bekannt sind.
-   * Holt neuen Token mit vollständigen Scopes.
-   */
   async upgradeScopes(appliances) {
     const fullScopes = scopesFromAppliances(appliances);
-    if (fullScopes === (this.scopes ?? MINIMAL_SCOPE)) {
-      log.debug("Scopes bereits vollständig, kein Upgrade nötig");
-      return false;
-    }
-    log.info({ scopes: fullScopes }, "Scopes upgrade - neuer Device Flow nötig");
+    if (fullScopes === (this.scopes ?? MINIMAL_SCOPE)) return false;
+    log.info({ scopes: fullScopes }, "Scopes upgrade");
     this.scopes = fullScopes;
-    // Alten Token löschen und neu autorisieren
     this.tokens = null;
     await this.#performDeviceFlow(fullScopes);
     return true;
@@ -51,49 +44,44 @@ export class HomeConnectAuth {
   }
 
   async refresh() {
-    log.info("Refreshe Home Connect Access Token");
-    const body = new URLSearchParams({
-      grant_type:    "refresh_token",
-      refresh_token: this.tokens.refresh_token,
-      client_secret: this.clientSecret,
-    });
+    log.info("Refreshe Access Token");
     const res = await fetch(`${this.base}/security/oauth/token`, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body,
+      body: new URLSearchParams({
+        grant_type:    "refresh_token",
+        refresh_token: this.tokens.refresh_token,
+        client_secret: this.clientSecret,
+      }),
     });
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`Refresh failed: ${res.status} ${text}`);
-    }
+    if (!res.ok) throw new Error(`Refresh failed: ${res.status} ${await res.text()}`);
     this.#storeTokenResponse(await res.json());
     await this.#saveToDisk();
   }
 
   async #performDeviceFlow(scopes) {
-    log.info({ scopes }, "Starte Home Connect Device Authorization Flow");
+    log.info({ scopes }, "Starte Device Authorization Flow");
     const daRes = await fetch(`${this.base}/security/oauth/device_authorization`, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({ client_id: this.clientId, scope: scopes }),
     });
-    if (!daRes.ok) {
-      const t = await daRes.text();
-      throw new Error(`device_authorization failed: ${daRes.status} ${t}`);
-    }
+    if (!daRes.ok) throw new Error(`device_authorization failed: ${daRes.status} ${await daRes.text()}`);
     const da = await daRes.json();
 
-    log.warn(
-      `\n\n============================================================\n` +
-      `  OPEN: ${da.verification_uri}\n` +
-      `  ENTER CODE: ${da.user_code}\n` +
-      (da.verification_uri_complete ? `  OR DIRECT: ${da.verification_uri_complete}\n` : "") +
-      `  Expires in ${da.expires_in}s\n` +
-      `============================================================\n`
-    );
+    const code    = da.user_code;
+    const link    = da.verification_uri_complete ?? `${da.verification_uri}?user_code=${da.user_code}`;
+    const expires = da.expires_in ?? 300;
+
+    log.warn(`\n${'='.repeat(60)}\n  OPEN: ${da.verification_uri}\n  CODE: ${code}\n  DIRECT: ${link}\n${'='.repeat(60)}`);
+
+    // Callback aufrufen damit die UI den Code anzeigen kann
+    if (this.onDeviceCode) {
+      this.onDeviceCode({ code, link, expires });
+    }
 
     const interval = (da.interval ?? 5) * 1000;
-    const deadline = Date.now() + (da.expires_in ?? 300) * 1000;
+    const deadline = Date.now() + expires * 1000;
 
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, interval));
@@ -109,14 +97,14 @@ export class HomeConnectAuth {
       if (tokRes.ok) {
         this.#storeTokenResponse(await tokRes.json());
         await this.#saveToDisk();
-        log.info("Home Connect Autorisierung erfolgreich");
+        log.info("Autorisierung erfolgreich");
         return;
       }
       const err = await tokRes.json().catch(() => ({}));
       if (err.error === "authorization_pending" || err.error === "slow_down") continue;
       throw new Error(`device flow failed: ${JSON.stringify(err)}`);
     }
-    throw new Error("Home Connect device flow timed out");
+    throw new Error("Device flow timed out");
   }
 
   #storeTokenResponse(data) {
@@ -136,7 +124,6 @@ export class HomeConnectAuth {
   async #loadFromDisk() {
     try {
       this.tokens = JSON.parse(await fs.readFile(this.tokenFile, "utf8"));
-      log.debug("Tokens von Disk geladen");
     } catch (err) {
       if (err.code !== "ENOENT") log.warn({ err }, "Token-Datei nicht lesbar");
     }
