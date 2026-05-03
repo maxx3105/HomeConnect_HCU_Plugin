@@ -1,10 +1,14 @@
 /**
  * HCU Home Connect Plugin
- * Startet erst wenn HC_CLIENT_ID und HC_CLIENT_SECRET
- * über HCUweb konfiguriert wurden.
+ *
+ * Ablauf:
+ * 1. Ohne Config: NOT_READY, wartet auf Konfiguration via HCUweb
+ * 2. Mit Config: Auth mit IdentifyAppliance (Minimal-Scope)
+ * 3. Geräte abfragen → benötigte Scopes ableiten
+ * 4. Falls neue Scopes nötig: neuer Device Flow mit vollen Scopes
+ * 5. Geräte in HCU registrieren + SSE-Stream starten
  */
 import fs from "node:fs/promises";
-import { existsSync } from "node:fs";
 import { logger } from "./logger.js";
 import { HomeConnectAuth } from "./homeconnect/auth.js";
 import { HomeConnectClient } from "./homeconnect/client.js";
@@ -12,13 +16,12 @@ import { HomeConnectEventStream } from "./homeconnect/events.js";
 import { HcuClient } from "./hcu/client.js";
 import { Bridge } from "./bridge.js";
 
-const PLUGIN_ID  = process.env.HCU_PLUGIN_ID ?? "com.github.maxx3105.homeconnect";
+const PLUGIN_ID   = process.env.HCU_PLUGIN_ID ?? "com.github.maxx3105.homeconnect";
 const CONFIG_FILE = "/data/config.json";
 
 async function resolveAuthToken() {
   try {
-    const t = await fs.readFile("/TOKEN", "utf8");
-    return t.trim();
+    return (await fs.readFile("/TOKEN", "utf8")).trim();
   } catch {
     const env = process.env.HCU_AUTH_TOKEN;
     if (env) return env;
@@ -28,11 +31,8 @@ async function resolveAuthToken() {
 
 async function loadConfig() {
   try {
-    const raw = await fs.readFile(CONFIG_FILE, "utf8");
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
+    return JSON.parse(await fs.readFile(CONFIG_FILE, "utf8"));
+  } catch { return null; }
 }
 
 async function saveConfig(cfg) {
@@ -47,25 +47,24 @@ async function main() {
   const hcuHost   = process.env.HCU_HOST ?? "host.containers.internal";
   const hcu       = new HcuClient({ host: hcuHost, authToken, pluginId: PLUGIN_ID });
 
-  // Config laden
   let cfg = await loadConfig();
 
-  // HCU verbinden - Config-Handler registrieren BEVOR start()
-  hcu.on("config_template_request", ({ correlationId, languageCode }) => {
+  // Config-Handler registrieren
+  hcu.on("config_template_request", ({ correlationId }) => {
     logger.info("Config-Template angefragt");
     hcu.sendConfigTemplateResponse({
       correlationId,
       groups: {
         homeconnect: {
           friendlyName: "Home Connect API",
-          description:  "Zugangsdaten der Home Connect Developer App",
+          description:  "Zugangsdaten der Home Connect Developer App (developer.home-connect.com)",
           order: 1
         }
       },
       properties: {
         hcClientId: {
           friendlyName:  "Client ID",
-          description:   "Home Connect API Client ID (developer.home-connect.com)",
+          description:   "Home Connect API Client ID",
           dataType:      "STRING",
           required:      "true",
           groupId:       "homeconnect",
@@ -82,28 +81,19 @@ async function main() {
           currentValue:  cfg?.clientSecret ? "••••••••" : "",
           minimumLength: 10,
           maximumLength: 200
-        },
-        hcScopes: {
-          friendlyName: "Scopes",
-          description:  "Geräte-Scopes (Space-getrennt)",
-          dataType:     "STRING",
-          required:     "false",
-          groupId:      "homeconnect",
-          currentValue: cfg?.scopes ?? "IdentifyAppliance Monitor Control Settings Dishwasher Washer Dryer CoffeeMaker Oven",
-          minimumLength: 5,
-          maximumLength: 500
         }
       }
     });
   });
 
   hcu.on("config_update_request", async ({ correlationId, properties }) => {
-    logger.info({ properties: Object.keys(properties) }, "Config-Update empfangen");
+    logger.info("Config-Update empfangen");
 
     const newCfg = {
       clientId:     properties.hcClientId     ?? cfg?.clientId,
-      clientSecret: properties.hcClientSecret ?? cfg?.clientSecret,
-      scopes:       properties.hcScopes       ?? cfg?.scopes ?? "IdentifyAppliance Monitor Control Settings",
+      clientSecret: (properties.hcClientSecret === "••••••••")
+                      ? cfg?.clientSecret
+                      : (properties.hcClientSecret ?? cfg?.clientSecret),
     };
 
     if (!newCfg.clientId || !newCfg.clientSecret) {
@@ -115,14 +105,11 @@ async function main() {
       return;
     }
 
-    // Wenn Secret ein Platzhalter ist, alten Wert behalten
-    if (newCfg.clientSecret === "••••••••" && cfg?.clientSecret) {
-      newCfg.clientSecret = cfg.clientSecret;
-    }
+    // Alten HC-Token löschen damit neuer Device Flow startet
+    try { await fs.unlink("/data/tokens.json"); } catch {}
 
     await saveConfig(newCfg);
-    cfg = newCfg;
-    logger.info("Konfiguration gespeichert");
+    logger.info("Konfiguration gespeichert, starte neu...");
 
     hcu.sendConfigUpdateResponse({
       correlationId,
@@ -130,39 +117,58 @@ async function main() {
       message: "Konfiguration gespeichert. Plugin wird neu gestartet..."
     });
 
-    // Kurz warten dann neu starten
     setTimeout(() => process.exit(0), 1000);
   });
 
   await hcu.start();
   await new Promise((resolve) => hcu.once("ready", resolve));
 
-  // Ohne Config: NOT_READY melden und auf Config warten
+  // Ohne Config: NOT_READY
   if (!cfg?.clientId || !cfg?.clientSecret) {
-    logger.warn("Keine Konfiguration vorhanden. Bitte in HCUweb konfigurieren.");
+    logger.warn("Keine Konfiguration. Bitte in HCUweb unter Plugin-Einstellungen konfigurieren.");
     hcu.setReadiness("NOT_READY");
-    // Warten bis Config gesetzt wird (via config_update_request → process.exit)
-    await new Promise(() => {}); // läuft bis Config gesetzt und Neustart
+    await new Promise(() => {}); // wartet bis Config gesetzt → Neustart
     return;
   }
 
   // Mit Config: Home Connect starten
-  logger.info("Konfiguration vorhanden, starte Home Connect...");
-  process.env.HC_CLIENT_ID     = cfg.clientId;
-  process.env.HC_CLIENT_SECRET = cfg.clientSecret;
-  process.env.HC_SCOPES        = cfg.scopes;
+  logger.info("Starte Home Connect...");
+  const auth = new HomeConnectAuth({
+    clientId:     cfg.clientId,
+    clientSecret: cfg.clientSecret,
+  });
 
-  const auth = new HomeConnectAuth();
+  // Schritt 1: Minimal-Auth (IdentifyAppliance)
   await auth.init();
 
-  const hc    = new HomeConnectClient(auth);
-  const sse   = new HomeConnectEventStream(auth);
+  const hc = new HomeConnectClient(auth);
+
+  // Schritt 2: Geräte abfragen
+  logger.info("Frage Home Connect Geräte ab...");
+  const appliances = await hc.listAppliances();
+  logger.info({ count: appliances.length, types: appliances.map(a => a.type) }, "Gefundene Geräte");
+
+  // Schritt 3: Scopes upgraden falls nötig
+  const upgraded = await auth.upgradeScopes(appliances);
+  if (upgraded) {
+    logger.info("Scopes wurden erweitert - Plugin startet neu für vollständigen Zugriff");
+    // Scopes in config cachen
+    cfg.cachedScopes = auth.scopes;
+    await saveConfig(cfg);
+    // Nach Device Flow direkt weiter (Token wurde bereits geholt)
+  }
+
+  // Schritt 4: Bridge starten
+  const sse    = new HomeConnectEventStream(auth);
   const bridge = new Bridge({ hcu, hc, sse });
-
   await bridge.run();
-  logger.info("Plugin läuft.");
 
-  const shutdown = (sig) => { logger.info({ sig }, "Shutdown"); sse.stop(); hcu.stop(); process.exit(0); };
+  logger.info("Plugin läuft. Alle Geräte registriert.");
+
+  const shutdown = (sig) => {
+    logger.info({ sig }, "Shutdown");
+    sse.stop(); hcu.stop(); process.exit(0);
+  };
   process.on("SIGINT",  () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
 }
