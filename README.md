@@ -69,7 +69,7 @@ Im Log des Containers (HCUweb → Plugin → Logs) nachsehen und Code eingeben.
 | `HC_CLIENT_ID` | Home Connect Client ID | ✅ |
 | `HC_CLIENT_SECRET` | Home Connect Client Secret | ✅ |
 | `HC_SCOPES` | OAuth Scopes (Space-getrennt) | Nein |
-| `HCU_PLUGIN_ID` | Plugin ID (Standard: `de.eq3.homeconnect`) | Nein |
+| `HCU_PLUGIN_ID` | Plugin ID (Standard: `com.github.maxx3105.homeconnect`) | Nein |
 | `HCU_HOST` | HCU-Host (nur für lokale Entwicklung) | Nein |
 | `HCU_AUTH_TOKEN` | Auth-Token (nur für lokale Entwicklung) | Nein |
 | `LOG_LEVEL` | `debug`/`info`/`warn` | Nein |
@@ -90,6 +90,6 @@ npm start
 
 Das Plugin-Manifest sitzt als Label im Dockerfile:
 ```
-LABEL de.eq3.hmip.plugin.metadata='{ "pluginId": "de.eq3.homeconnect", ... }'
+LABEL de.eq3.hmip.plugin.metadata='{ "pluginId": "com.github.maxx3105.homeconnect", ... }'
 ```
 Pflichtfelder: `pluginId`, `issuer`, `version`, `hcuMinVersion`, `scope`, `friendlyName.de`

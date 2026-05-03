@@ -13,7 +13,7 @@ import { HomeConnectEventStream } from "./homeconnect/events.js";
 import { HcuClient } from "./hcu/client.js";
 import { Bridge } from "./bridge.js";
 
-const PLUGIN_ID = process.env.HCU_PLUGIN_ID ?? "de.eq3.homeconnect";
+const PLUGIN_ID = process.env.HCU_PLUGIN_ID ?? "com.github.maxx3105.homeconnect";
 
 async function resolveAuthToken() {
   try {

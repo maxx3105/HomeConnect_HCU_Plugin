@@ -14,8 +14,8 @@
 
 set -e
 
-PLUGIN_ID="de.eq3.homeconnect"
-IMAGE_TAG="de/eq3/homeconnect:0.1.0"
+PLUGIN_ID="com.github.maxx3105.homeconnect"
+IMAGE_TAG="com.github.maxx3105.homeconnect:0.1.0"
 OUTPUT="homeconnect-plugin-0.1.0.tar.gz"
 
 echo "=== HCU Home Connect Plugin Build ==="
