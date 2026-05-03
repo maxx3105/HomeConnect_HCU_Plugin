@@ -91,16 +91,18 @@ export class Bridge {
       return this.hcu.sendControlResponse(false, "UNSUPPORTED_FEATURE", correlationId);
     }
 
+    // Dimmer ignorieren
+    if (plan.action === "ignore") {
+      this.hcu.sendControlResponse(true, null, correlationId);
+      return;
+    }
+
     try {
-      if (plan.action === "powerOn") {
-        await this.hc.setSetting(haId, "BSH.Common.Setting.PowerState",
-          "BSH.Common.EnumType.PowerState.On");
-      } else if (plan.action === "powerOff") {
-        // Versuche zuerst Standby, dann Off
-        await this.hc.setSetting(haId, "BSH.Common.Setting.PowerState",
-          "BSH.Common.EnumType.PowerState.Standby")
-          .catch(() => this.hc.setSetting(haId, "BSH.Common.Setting.PowerState",
-            "BSH.Common.EnumType.PowerState.Off"));
+      if (plan.action === "startProgram") {
+        // Vorgewähltes Programm starten
+        await this.hc.sendCommand(haId, "BSH.Common.Command.StartProgram", true);
+      } else if (plan.action === "stopProgram") {
+        await this.hc.stopProgram(haId);
       }
       this.hcu.sendControlResponse(true, null, correlationId);
     } catch (err) {
