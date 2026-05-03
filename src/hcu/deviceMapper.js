@@ -1,57 +1,103 @@
 /**
  * Mapping Home Connect → HCU Devices
  *
- * HC-Geräte die wir als HCU-SWITCH mappen:
- *   Dishwasher, Washer, Dryer, WasherDryer, CoffeeMaker, Oven, Hood, Hob
+ * Pro Gerät 3 Devices:
  *
- * Für jedes Gerät gibt es:
- *   - Ein SWITCH-Device (An/Aus via PowerState)
- *   - Ein CONTACT_SENSOR-Device für Tür (falls vorhanden)
+ * 1. LIGHT  (friendlyName: Gerätename)
+ *    - switchState: on = Gerät aktiv (OperationState = Run/Pause/DelayedStart)
+ *    - dimming:     dimLevel 0.0-1.0 = Fortschritt (ProgramProgress ÷ 100)
+ *    - maintenance: unreach = Gerät offline
+ *    → Steuerbar: switchState on/off → PowerState On/Standby
  *
- * HC Status-Keys die wir als Features pushen:
- *   BSH.Common.Status.OperationState   → switchState (on = Running/Pause/DelayedStart)
- *   BSH.Common.Status.DoorState        → contactSensorState (open = Door.Open)
- *   BSH.Common.Setting.PowerState      → switchState (on = PowerState.On)
- *   BSH.Common.Option.RemainingProgramTime → Meta-Info (kein HCU Feature, aber STATUS_EVENT)
+ * 2. CLIMATE_SENSOR  (friendlyName: Gerätename + " Timer")
+ *    - sunshineDuration: sunshineDuration = Restzeit in Sekunden
+ *
+ * 3. CONTACT_SENSOR  (friendlyName: Gerätename + " Fernstart")
+ *    - contactSensorState: triggered = RemoteControlStartAllowed aktiv
+ *
+ * Optional (Dishwasher):
+ * 4. WATER_SENSOR  (friendlyName: Gerätename + " Vorräte")
+ *    - waterlevelDetected: Salz fast leer
+ *    - moistureDetected:   Klarspüler fast leer
  */
-import { DEVICE_TYPE, makeDevice, makeSwitchFeature, makeContactFeature } from "./protocol.js";
+import { makeDevice } from "./protocol.js";
+
+export const DEVICE_TYPE = {
+  LIGHT:          "LIGHT",
+  CLIMATE_SENSOR: "CLIMATE_SENSOR",
+  CONTACT_SENSOR: "CONTACT_SENSOR",
+  WATER_SENSOR:   "WATER_SENSOR",
+};
 
 /** Gerätetypen mit Tür */
 const HAS_DOOR = new Set([
   "Dishwasher", "Washer", "Dryer", "WasherDryer",
-  "Oven", "Microwave", "Refrigerator", "Freezer", "FridgeFreezer", "WineCooler"
+  "Oven", "Microwave"
 ]);
 
+/** Gerätetypen mit Vorrats-Warnungen (Salz, Klarspüler) */
+const HAS_SUPPLIES = new Set(["Dishwasher"]);
+
 /**
- * Erstellt HCU-Devices aus einer HC-Appliance.
- * Gibt Array zurück (1 oder 2 Devices pro Appliance).
+ * Erstellt alle HCU-Devices für eine HC-Appliance.
  */
 export function applianceToDevices(app) {
-  const devices = [];
-  const baseId = `hc-${app.haId}`;
+  const baseId   = `hc-${app.haId}`;
   const baseName = app.name ?? `${app.brand ?? "HC"} ${app.type}`;
+  const model    = app.vib ?? app.enumber ?? app.type;
+  const fw       = app.enumber ?? "n/a";
 
-  // Haupt-Device: SWITCH (Power on/off + Betriebsstatus)
+  const devices = [];
+
+  // 1. LIGHT — Hauptgerät (läuft/läuft-nicht + Fortschritt)
   devices.push(makeDevice({
-    deviceId:        baseId,
-    deviceType:      DEVICE_TYPE.SWITCH,
-    friendlyName:    baseName,
-    modelType:       app.vib ?? app.enumber ?? app.type,
-    firmwareVersion: app.enumber ?? "n/a",
+    deviceId:     baseId,
+    deviceType:   DEVICE_TYPE.LIGHT,
+    friendlyName: baseName,
+    modelType:    model,
+    firmwareVersion: fw,
     features: [
-      makeSwitchFeature(false),  // initial: aus
+      { type: "switchState", on: false },
+      { type: "dimming",     dimLevel: 0 },
+      { type: "maintenance", unreach: false, lowBat: false, sabotage: false },
     ],
   }));
 
-  // Tür-Device: CONTACT_SENSOR (Tür offen/geschlossen)
-  if (HAS_DOOR.has(app.type)) {
+  // 2. CLIMATE_SENSOR — Restzeit
+  devices.push(makeDevice({
+    deviceId:     `${baseId}-timer`,
+    deviceType:   DEVICE_TYPE.CLIMATE_SENSOR,
+    friendlyName: `${baseName} Restzeit`,
+    modelType:    model,
+    firmwareVersion: fw,
+    features: [
+      { type: "sunshineDuration", sunshineDuration: 0, todaySunshineDuration: 0, yesterdaySunshineDuration: 0 },
+    ],
+  }));
+
+  // 3. CONTACT_SENSOR — Fernstart erlaubt
+  devices.push(makeDevice({
+    deviceId:     `${baseId}-remote`,
+    deviceType:   DEVICE_TYPE.CONTACT_SENSOR,
+    friendlyName: `${baseName} Fernstart`,
+    modelType:    model,
+    firmwareVersion: fw,
+    features: [
+      { type: "contactSensorState", triggered: false },
+    ],
+  }));
+
+  // 4. WATER_SENSOR — Vorräte (nur Dishwasher)
+  if (HAS_SUPPLIES.has(app.type)) {
     devices.push(makeDevice({
-      deviceId:     `${baseId}-door`,
-      deviceType:   DEVICE_TYPE.CONTACT_SENSOR,
-      friendlyName: `${baseName} Tür`,
-      modelType:    app.type,
+      deviceId:     `${baseId}-supplies`,
+      deviceType:   DEVICE_TYPE.WATER_SENSOR,
+      friendlyName: `${baseName} Vorräte`,
+      modelType:    model,
+      firmwareVersion: fw,
       features: [
-        makeContactFeature(false), // initial: geschlossen
+        { type: "waterlevelDetected", waterlevelDetected: false }, // Salz
+        { type: "moistureDetected",   moistureDetected: false },   // Klarspüler
       ],
     }));
   }
@@ -60,79 +106,132 @@ export function applianceToDevices(app) {
 }
 
 /**
- * Übersetzt Home Connect SSE Items in HCU STATUS_EVENTs.
+ * Übersetzt HC SSE Items in HCU STATUS_EVENTs.
  * Gibt Array von { deviceId, features } zurück.
- *
- * @param {string} baseDeviceId  z.B. "hc-SIEMENS-xxx"
- * @param {Array}  items         HC SSE items
  */
 export function itemsToStatusEvents(baseDeviceId, items) {
   const events = [];
 
+  // Aggregierte Updates pro Device
+  const lightFeatures    = {};
+  const timerFeatures    = {};
+  const remoteFeatures   = {};
+  const suppliesFeatures = {};
+
   for (const it of items ?? []) {
     switch (it.key) {
 
-      // PowerState → SWITCH on/off
-      case "BSH.Common.Setting.PowerState":
-        events.push({
-          deviceId: baseDeviceId,
-          features: [makeSwitchFeature(
-            it.value === "BSH.Common.EnumType.PowerState.On"
-          )],
-        });
-        break;
-
-      // OperationState → SWITCH on = aktiv (läuft / pausiert / verzögert)
+      // Betriebszustand → switchState + dimLevel reset wenn fertig
       case "BSH.Common.Status.OperationState": {
-        const active = [
+        const running = [
           "BSH.Common.EnumType.OperationState.Run",
           "BSH.Common.EnumType.OperationState.Pause",
           "BSH.Common.EnumType.OperationState.DelayedStart",
           "BSH.Common.EnumType.OperationState.ActionRequired",
         ].includes(it.value);
-        events.push({
-          deviceId: baseDeviceId,
-          features: [makeSwitchFeature(active)],
-        });
+        lightFeatures.switchState = { type: "switchState", on: running };
+        if (!running) {
+          lightFeatures.dimming = { type: "dimming", dimLevel: 0 };
+        }
         break;
       }
 
-      // DoorState → CONTACT_SENSOR open/closed
-      case "BSH.Common.Status.DoorState":
-        events.push({
-          deviceId: `${baseDeviceId}-door`,
-          features: [makeContactFeature(
-            it.value === "BSH.Common.EnumType.DoorState.Open"
-          )],
-        });
+      // PowerState → auch switchState
+      case "BSH.Common.Setting.PowerState":
+        if (it.value === "BSH.Common.EnumType.PowerState.Off" ||
+            it.value === "BSH.Common.EnumType.PowerState.Standby") {
+          lightFeatures.switchState = { type: "switchState", on: false };
+          lightFeatures.dimming     = { type: "dimming", dimLevel: 0 };
+        }
         break;
 
-      // ProgramFinished/Aborted → SWITCH off
+      // Fortschritt → dimLevel (0.0 - 1.0)
+      case "BSH.Common.Option.ProgramProgress":
+        lightFeatures.dimming = { type: "dimming", dimLevel: Number(it.value ?? 0) / 100 };
+        break;
+
+      // Restzeit → sunshineDuration (Sekunden)
+      case "BSH.Common.Option.RemainingProgramTime":
+        timerFeatures.sunshineDuration = {
+          type: "sunshineDuration",
+          sunshineDuration:          Number(it.value ?? 0),
+          todaySunshineDuration:     Number(it.value ?? 0),
+          yesterdaySunshineDuration: 0,
+        };
+        break;
+
+      // Remote Start erlaubt → contactSensorState triggered
+      case "BSH.Common.Status.RemoteControlStartAllowed":
+        remoteFeatures.contactSensorState = {
+          type:      "contactSensorState",
+          triggered: it.value === true || it.value === "true",
+        };
+        break;
+
+      // Offline → maintenance.unreach
+      case "connected":
+        lightFeatures.maintenance = {
+          type:     "maintenance",
+          unreach:  it.value === false || it.value === "false",
+          lowBat:   false,
+          sabotage: false,
+        };
+        break;
+
+      // Programm fertig/abgebrochen → aus + Fortschritt 0
       case "BSH.Common.Event.ProgramFinished":
       case "BSH.Common.Event.ProgramAborted":
-        events.push({
-          deviceId: baseDeviceId,
-          features: [makeSwitchFeature(false)],
-        });
+        lightFeatures.switchState = { type: "switchState", on: false };
+        lightFeatures.dimming     = { type: "dimming", dimLevel: 0 };
+        timerFeatures.sunshineDuration = {
+          type: "sunshineDuration",
+          sunshineDuration: 0, todaySunshineDuration: 0, yesterdaySunshineDuration: 0
+        };
+        break;
+
+      // Salz fast leer → waterlevelDetected
+      case "Dishcare.Dishwasher.Event.SaltNearlyEmpty":
+        suppliesFeatures.waterlevelDetected = {
+          type: "waterlevelDetected",
+          waterlevelDetected: it.value !== "BSH.Common.EnumType.EventPresentState.Off",
+        };
+        break;
+
+      // Klarspüler fast leer → moistureDetected
+      case "Dishcare.Dishwasher.Event.RinseAidNearlyEmpty":
+        suppliesFeatures.moistureDetected = {
+          type: "moistureDetected",
+          moistureDetected: it.value !== "BSH.Common.EnumType.EventPresentState.Off",
+        };
         break;
     }
   }
+
+  // Events zusammenbauen
+  if (Object.keys(lightFeatures).length > 0)
+    events.push({ deviceId: baseDeviceId,            features: Object.values(lightFeatures) });
+  if (Object.keys(timerFeatures).length > 0)
+    events.push({ deviceId: `${baseDeviceId}-timer`,   features: Object.values(timerFeatures) });
+  if (Object.keys(remoteFeatures).length > 0)
+    events.push({ deviceId: `${baseDeviceId}-remote`,  features: Object.values(remoteFeatures) });
+  if (Object.keys(suppliesFeatures).length > 0)
+    events.push({ deviceId: `${baseDeviceId}-supplies`, features: Object.values(suppliesFeatures) });
 
   return events;
 }
 
 /**
- * Übersetzt HCU CONTROL_REQUEST in HC-Aktion.
- * features = Array von Feature-Objekten aus dem CONTROL_REQUEST body.
+ * HCU CONTROL_REQUEST → HC Aktion
  */
-export function featuresToHcAction(features) {
+export function featuresToHcAction(deviceId, features) {
+  // Nur das Haupt-Device ist steuerbar
+  if (deviceId.endsWith("-timer") || deviceId.endsWith("-remote") || deviceId.endsWith("-supplies")) {
+    return null;
+  }
+
   for (const f of features ?? []) {
     if (f.type === "switchState") {
-      if (f.on) {
-        return { action: "powerOn" };
-      } else {
-        return { action: "powerOff" };
-      }
+      return f.on ? { action: "powerOn" } : { action: "powerOff" };
     }
   }
   return null;

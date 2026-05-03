@@ -86,7 +86,7 @@ export class Bridge {
       return this.hcu.sendControlResponse(false, "UNKNOWN_DEVICE", correlationId);
     }
 
-    const plan = featuresToHcAction(features);
+    const plan = featuresToHcAction(deviceId, features);
     if (!plan) {
       return this.hcu.sendControlResponse(false, "UNSUPPORTED_FEATURE", correlationId);
     }
