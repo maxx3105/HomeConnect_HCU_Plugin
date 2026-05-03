@@ -2,13 +2,13 @@ import { EventEmitter } from "node:events";
 import WebSocket from "ws";
 import { childLogger } from "../logger.js";
 import {
-  MSG_IN,
+  MSG_IN, MSG_OUT,
   buildPluginStateResponse,
   buildDiscoverResponse,
   buildStatusEvent,
+  buildStatusResponse,
   buildControlResponse,
 } from "./protocol.js";
-import { randomUUID } from "node:crypto";
 
 const log = childLogger("hcu");
 
@@ -22,11 +22,11 @@ export class HcuClient extends EventEmitter {
     this.stopped   = false;
     this.reconnectDelay = 3000;
     this._readiness = "READY";
+    this._deviceCache = new Map(); // deviceId → device
   }
 
   setReadiness(status) {
     this._readiness = status;
-    // PLUGIN_STATE_RESPONSE mit neuem Status senden
     this.#send(buildPluginStateResponse(this.pluginId, null, status));
   }
 
@@ -41,6 +41,7 @@ export class HcuClient extends EventEmitter {
   }
 
   sendDiscoverResponse(devices, correlationId) {
+    for (const d of devices) this._deviceCache.set(d.deviceId, d);
     this.#send(buildDiscoverResponse(this.pluginId, devices, correlationId));
   }
 
@@ -54,19 +55,19 @@ export class HcuClient extends EventEmitter {
 
   sendConfigTemplateResponse({ correlationId, groups, properties }) {
     this.#send({
-      id:       correlationId,
+      id: correlationId ?? undefined,
       pluginId: this.pluginId,
-      type:     "CONFIG_TEMPLATE_RESPONSE",
-      body:     { groups, properties }
+      type: MSG_OUT.CONFIG_TEMPLATE_RESPONSE,
+      body: { groups, properties }
     });
   }
 
   sendConfigUpdateResponse({ correlationId, status, message }) {
     this.#send({
-      id:       correlationId,
+      id: correlationId,
       pluginId: this.pluginId,
-      type:     "CONFIG_UPDATE_RESPONSE",
-      body:     { status, ...(message ? { message } : {}) }
+      type: MSG_OUT.CONFIG_UPDATE_RESPONSE,
+      body: { status, ...(message ? { message } : {}) }
     });
   }
 
@@ -77,10 +78,7 @@ export class HcuClient extends EventEmitter {
 
     this.ws = new WebSocket(url, {
       rejectUnauthorized: false,
-      headers: {
-        "authtoken": this.authToken,
-        "plugin-id": this.pluginId,
-      },
+      headers: { "authtoken": this.authToken, "plugin-id": this.pluginId },
     });
 
     this.ws.on("open", () => {
@@ -93,19 +91,17 @@ export class HcuClient extends EventEmitter {
     this.ws.on("message", (raw) => {
       let msg;
       try { msg = JSON.parse(raw.toString()); }
-      catch { log.warn({ raw: raw.toString().slice(0,200) }, "Ungültige JSON"); return; }
+      catch { log.warn({ raw: raw.toString().slice(0, 200) }, "Ungültige JSON"); return; }
       this.#route(msg);
     });
 
     this.ws.on("close", (code, reason) => {
       log.warn({ code, reason: reason?.toString() }, "HCU WebSocket geschlossen");
       this.emit("disconnected");
-      if (!this.stopped) {
-        setTimeout(() => {
-          this.reconnectDelay = Math.min(this.reconnectDelay * 2, 60000);
-          this.#connect();
-        }, this.reconnectDelay);
-      }
+      if (!this.stopped) setTimeout(() => {
+        this.reconnectDelay = Math.min(this.reconnectDelay * 2, 60000);
+        this.#connect();
+      }, this.reconnectDelay);
     });
 
     this.ws.on("error", (err) => log.error({ err: err.message }, "HCU Fehler"));
@@ -120,39 +116,35 @@ export class HcuClient extends EventEmitter {
   #route(msg) {
     const type = msg?.type;
     log.debug({ type, id: msg?.id }, "← HCU");
-
     switch (type) {
-      case "PLUGIN_STATE_REQUEST":
+      case MSG_IN.PLUGIN_STATE_REQUEST:
         this.#send(buildPluginStateResponse(this.pluginId, msg.id, this._readiness));
         return;
-
-      case "DISCOVER_REQUEST":
+      case MSG_IN.DISCOVER_REQUEST:
         this.emit("discover_request", { correlationId: msg.id });
         return;
-
-      case "CONTROL_REQUEST":
+      case MSG_IN.STATUS_REQUEST: {
+        // HCU fragt aktuellen Status eines Geräts
+        const deviceId = msg.body?.deviceId;
+        const device   = this._deviceCache.get(deviceId);
+        if (device) {
+          this.#send(buildStatusResponse(this.pluginId, deviceId, device.features, msg.id));
+        }
+        return;
+      }
+      case MSG_IN.CONTROL_REQUEST:
         this.emit("control_request", {
-          deviceId: msg.body?.deviceId,
-          features: msg.body?.features,
-          correlationId: msg.id
-        });
-        return;
-
-      case "CONFIG_TEMPLATE_REQUEST":
-        this.emit("config_template_request", {
+          deviceId:     msg.body?.deviceId,
+          features:     msg.body?.features,
           correlationId: msg.id,
-          languageCode:  msg.body?.languageCode ?? "de"
         });
         return;
-
-      case "CONFIG_UPDATE_REQUEST":
-        this.emit("config_update_request", {
-          correlationId: msg.id,
-          languageCode:  msg.body?.languageCode ?? "de",
-          properties:    msg.body?.properties ?? {}
-        });
+      case MSG_IN.CONFIG_TEMPLATE_REQUEST:
+        this.emit("config_template_request", { correlationId: msg.id, languageCode: msg.body?.languageCode ?? "de" });
         return;
-
+      case MSG_IN.CONFIG_UPDATE_REQUEST:
+        this.emit("config_update_request", { correlationId: msg.id, properties: msg.body?.properties ?? {} });
+        return;
       default:
         log.debug({ type }, "Unbekannte Nachricht");
     }

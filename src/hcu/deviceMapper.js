@@ -1,111 +1,138 @@
-import { DEVICE_TYPE, FEATURE, makeDevice, makeFeature } from "../hcu/protocol.js";
+/**
+ * Mapping Home Connect → HCU Devices
+ *
+ * HC-Geräte die wir als HCU-SWITCH mappen:
+ *   Dishwasher, Washer, Dryer, WasherDryer, CoffeeMaker, Oven, Hood, Hob
+ *
+ * Für jedes Gerät gibt es:
+ *   - Ein SWITCH-Device (An/Aus via PowerState)
+ *   - Ein CONTACT_SENSOR-Device für Tür (falls vorhanden)
+ *
+ * HC Status-Keys die wir als Features pushen:
+ *   BSH.Common.Status.OperationState   → switchState (on = Running/Pause/DelayedStart)
+ *   BSH.Common.Status.DoorState        → contactSensorState (open = Door.Open)
+ *   BSH.Common.Setting.PowerState      → switchState (on = PowerState.On)
+ *   BSH.Common.Option.RemainingProgramTime → Meta-Info (kein HCU Feature, aber STATUS_EVENT)
+ */
+import { DEVICE_TYPE, makeDevice, makeSwitchFeature, makeContactFeature } from "./protocol.js";
+
+/** Gerätetypen mit Tür */
+const HAS_DOOR = new Set([
+  "Dishwasher", "Washer", "Dryer", "WasherDryer",
+  "Oven", "Microwave", "Refrigerator", "Freezer", "FridgeFreezer", "WineCooler"
+]);
 
 /**
- * Bildet eine Home-Connect-Appliance auf ein HCU-Device ab.
- * Feature-Schema nach Connect API Doku 1.0.1, Kap. 6.7.
+ * Erstellt HCU-Devices aus einer HC-Appliance.
+ * Gibt Array zurück (1 oder 2 Devices pro Appliance).
  */
-export function applianceToDevice(app) {
-  const features = buildFeatures(app.type);
-  return makeDevice({
-    id:              `hc-${app.haId}`,
-    type:            DEVICE_TYPE.GENERIC_INPUT,
-    label:           app.name ?? `${app.brand ?? "HC"} ${app.type}`,
-    manufacturerId:  app.brand ?? "Home Connect",
-    modelId:         app.vib  ?? app.enumber ?? app.type,
+export function applianceToDevices(app) {
+  const devices = [];
+  const baseId = `hc-${app.haId}`;
+  const baseName = app.name ?? `${app.brand ?? "HC"} ${app.type}`;
+
+  // Haupt-Device: SWITCH (Power on/off + Betriebsstatus)
+  devices.push(makeDevice({
+    deviceId:        baseId,
+    deviceType:      DEVICE_TYPE.SWITCH,
+    friendlyName:    baseName,
+    modelType:       app.vib ?? app.enumber ?? app.type,
     firmwareVersion: app.enumber ?? "n/a",
-    features,
-  });
-}
+    features: [
+      makeSwitchFeature(false),  // initial: aus
+    ],
+  }));
 
-function buildFeatures(type) {
-  const f = [
-    // Alle Geräte: An/Aus (PowerState → SWITCH)
-    makeFeature(FEATURE.SWITCH, { on: false }),
-  ];
-
-  // Geräte mit Tür: GENERIC_INPUT für Tür-Status
-  const hasDoor = ["Dishwasher","Washer","Dryer","WasherDryer","Oven","Microwave",
-                   "Refrigerator","Freezer","FridgeFreezer","WineCooler"];
-  if (hasDoor.includes(type)) {
-    f.push(makeFeature(FEATURE.GENERIC_INPUT, {
-      key: "doorState", value: "closed", label: "Tür",
+  // Tür-Device: CONTACT_SENSOR (Tür offen/geschlossen)
+  if (HAS_DOOR.has(app.type)) {
+    devices.push(makeDevice({
+      deviceId:     `${baseId}-door`,
+      deviceType:   DEVICE_TYPE.CONTACT_SENSOR,
+      friendlyName: `${baseName} Tür`,
+      modelType:    app.type,
+      features: [
+        makeContactFeature(false), // initial: geschlossen
+      ],
     }));
   }
 
-  // Geräte mit Temperatur-Setpoint (Ofen etc.)
-  if (["Oven","Microwave","WarmingDrawer"].includes(type)) {
-    f.push(makeFeature(FEATURE.SETPOINT_TEMPERATURE, { value: 0, unit: "CELSIUS" }));
-    f.push(makeFeature(FEATURE.ACTUAL_TEMPERATURE,   { value: 0, unit: "CELSIUS" }));
-  }
-
-  // Alle: generische Status-Felder für Betriebsstatus, Restzeit, Programm
-  f.push(makeFeature(FEATURE.GENERIC_INPUT, {
-    key: "operationState", value: "Ready", label: "Status",
-  }));
-  f.push(makeFeature(FEATURE.GENERIC_INPUT, {
-    key: "remainingTime", value: 0, label: "Restzeit (s)",
-  }));
-  f.push(makeFeature(FEATURE.GENERIC_INPUT, {
-    key: "activeProgram", value: "", label: "Programm",
-  }));
-
-  return f;
+  return devices;
 }
 
 /**
- * Übersetzt Home-Connect-Items in Feature-Updates.
- * Rückgabe: Array von { key, value } Paaren für GENERIC_INPUT Features
- * oder { featureType, properties } für typisierte Features.
+ * Übersetzt Home Connect SSE Items in HCU STATUS_EVENTs.
+ * Gibt Array von { deviceId, features } zurück.
+ *
+ * @param {string} baseDeviceId  z.B. "hc-SIEMENS-xxx"
+ * @param {Array}  items         HC SSE items
  */
-export function itemsToFeatureUpdates(items) {
-  const updates = [];
+export function itemsToStatusEvents(baseDeviceId, items) {
+  const events = [];
+
   for (const it of items ?? []) {
     switch (it.key) {
+
+      // PowerState → SWITCH on/off
       case "BSH.Common.Setting.PowerState":
-        updates.push({ featureType: FEATURE.SWITCH,
-          props: { on: it.value === "BSH.Common.EnumType.PowerState.On" } });
+        events.push({
+          deviceId: baseDeviceId,
+          features: [makeSwitchFeature(
+            it.value === "BSH.Common.EnumType.PowerState.On"
+          )],
+        });
         break;
-      case "BSH.Common.Status.OperationState":
-        updates.push({ featureType: FEATURE.GENERIC_INPUT,
-          props: { key: "operationState", value: String(it.value ?? "").split(".").pop() } });
+
+      // OperationState → SWITCH on = aktiv (läuft / pausiert / verzögert)
+      case "BSH.Common.Status.OperationState": {
+        const active = [
+          "BSH.Common.EnumType.OperationState.Run",
+          "BSH.Common.EnumType.OperationState.Pause",
+          "BSH.Common.EnumType.OperationState.DelayedStart",
+          "BSH.Common.EnumType.OperationState.ActionRequired",
+        ].includes(it.value);
+        events.push({
+          deviceId: baseDeviceId,
+          features: [makeSwitchFeature(active)],
+        });
         break;
+      }
+
+      // DoorState → CONTACT_SENSOR open/closed
       case "BSH.Common.Status.DoorState":
-        updates.push({ featureType: FEATURE.GENERIC_INPUT,
-          props: { key: "doorState",
-            value: it.value === "BSH.Common.EnumType.DoorState.Open" ? "open" : "closed" } });
+        events.push({
+          deviceId: `${baseDeviceId}-door`,
+          features: [makeContactFeature(
+            it.value === "BSH.Common.EnumType.DoorState.Open"
+          )],
+        });
         break;
-      case "BSH.Common.Root.ActiveProgram":
-        updates.push({ featureType: FEATURE.GENERIC_INPUT,
-          props: { key: "activeProgram", value: String(it.value ?? "").split(".").pop() } });
-        break;
-      case "BSH.Common.Option.RemainingProgramTime":
-        updates.push({ featureType: FEATURE.GENERIC_INPUT,
-          props: { key: "remainingTime", value: Number(it.value ?? 0) } });
-        break;
+
+      // ProgramFinished/Aborted → SWITCH off
       case "BSH.Common.Event.ProgramFinished":
-        updates.push({ featureType: FEATURE.GENERIC_INPUT,
-          props: { key: "operationState", value: "Finished" } });
-        break;
       case "BSH.Common.Event.ProgramAborted":
-        updates.push({ featureType: FEATURE.GENERIC_INPUT,
-          props: { key: "operationState", value: "Aborted" } });
+        events.push({
+          deviceId: baseDeviceId,
+          features: [makeSwitchFeature(false)],
+        });
         break;
     }
   }
-  return updates;
+
+  return events;
 }
 
 /**
- * Übersetzt HCU-Control-Features in Home-Connect-Aktionen.
+ * Übersetzt HCU CONTROL_REQUEST in HC-Aktion.
+ * features = Array von Feature-Objekten aus dem CONTROL_REQUEST body.
  */
 export function featuresToHcAction(features) {
-  if (!features) return null;
-  for (const f of features) {
-    if (f.type === FEATURE.SWITCH && f.on !== undefined) {
-      return { action: "setPower", args: { on: !!f.on } };
-    }
-    if (f.type === FEATURE.GENERIC_INPUT && f.key === "activeProgram" && f.value) {
-      return { action: "startProgram", args: { programKey: f.value, options: [] } };
+  for (const f of features ?? []) {
+    if (f.type === "switchState") {
+      if (f.on) {
+        return { action: "powerOn" };
+      } else {
+        return { action: "powerOff" };
+      }
     }
   }
   return null;

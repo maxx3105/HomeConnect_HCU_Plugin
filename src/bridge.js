@@ -1,5 +1,5 @@
 import { childLogger } from "./logger.js";
-import { applianceToDevice, itemsToFeatureUpdates, featuresToHcAction } from "./hcu/deviceMapper.js";
+import { applianceToDevices, itemsToStatusEvents, featuresToHcAction } from "./hcu/deviceMapper.js";
 
 const log = childLogger("bridge");
 
@@ -8,10 +8,10 @@ export class Bridge {
     this.hcu = hcu;
     this.hc  = hc;
     this.sse = sse;
-    /** @type {Map<string, object>} deviceId → device */
-    this.devices = new Map();
-    /** @type {Map<string, string>} deviceId → haId */
+    /** Map: baseDeviceId → haId */
     this.deviceToHaId = new Map();
+    /** Map: deviceId → device (alle inkl. Tür-Devices) */
+    this.devices = new Map();
   }
 
   async run() {
@@ -21,24 +21,23 @@ export class Bridge {
     await this.sse.start();
   }
 
-  // ── Discovery ─────────────────────────────────────────────────────────────
-
   async #discover() {
-    log.info("Suche Home-Connect-Geräte");
+    log.info("Suche Home Connect Geräte");
     const apps = await this.hc.listAppliances();
     log.info({ count: apps.length }, "Gefundene Geräte");
 
     for (const app of apps) {
-      const device = applianceToDevice(app);
-      this.devices.set(device.id, device);
-      this.deviceToHaId.set(device.id, app.haId);
-      try { await this.#syncInitialState(app.haId, device.id); }
+      const devs = applianceToDevices(app);
+      const baseId = `hc-${app.haId}`;
+      this.deviceToHaId.set(baseId, app.haId);
+      for (const d of devs) this.devices.set(d.deviceId, d);
+      try { await this.#syncInitialState(app.haId, baseId); }
       catch (err) { log.warn({ err: err.message, haId: app.haId }, "Initialzustand nicht abrufbar"); }
     }
     log.info({ count: this.devices.size }, "Geräte bereit");
   }
 
-  async #syncInitialState(haId, deviceId) {
+  async #syncInitialState(haId, baseId) {
     const [status, settings, active] = await Promise.all([
       this.hc.getStatus(haId).catch(() => []),
       this.hc.getSettings(haId).catch(() => []),
@@ -46,28 +45,29 @@ export class Bridge {
     ]);
     const items = [
       ...status, ...settings,
-      ...(active?.options ?? []),
       ...(active?.key ? [{ key: "BSH.Common.Root.ActiveProgram", value: active.key }] : []),
     ];
-    this.#applyUpdates(deviceId, items);
+    // Status-Events für initiale Zustände
+    const events = itemsToStatusEvents(baseId, items);
+    for (const ev of events) {
+      // Device-Cache aktualisieren
+      const dev = this.devices.get(ev.deviceId);
+      if (dev) dev.features = ev.features;
+    }
   }
 
-  // ── HCU Events ───────────────────────────────────────────────────────────
-
   #wireHcu() {
-    // Nach (Re-)Connect: Geräteliste sofort pushen
     this.hcu.on("ready", () => {
       if (this.devices.size > 0) {
         this.hcu.sendDiscoverResponse([...this.devices.values()], null);
       }
     });
 
-    // DISCOVER_REQUEST: HCU will Geräteliste
     this.hcu.on("discover_request", ({ correlationId }) => {
+      log.info("DISCOVER_REQUEST empfangen");
       this.hcu.sendDiscoverResponse([...this.devices.values()], correlationId);
     });
 
-    // CONTROL_REQUEST: HCU will Gerät steuern
     this.hcu.on("control_request", async ({ deviceId, features, correlationId }) => {
       await this.#handleControl({ deviceId, features, correlationId });
     });
@@ -75,26 +75,32 @@ export class Bridge {
 
   async #handleControl({ deviceId, features, correlationId }) {
     log.info({ deviceId, features }, "Control Request");
+
+    // Tür-Devices können nicht gesteuert werden
+    if (deviceId.endsWith("-door")) {
+      return this.hcu.sendControlResponse(false, "READ_ONLY", correlationId);
+    }
+
     const haId = this.deviceToHaId.get(deviceId);
     if (!haId) {
       return this.hcu.sendControlResponse(false, "UNKNOWN_DEVICE", correlationId);
     }
+
     const plan = featuresToHcAction(features);
     if (!plan) {
       return this.hcu.sendControlResponse(false, "UNSUPPORTED_FEATURE", correlationId);
     }
+
     try {
-      switch (plan.action) {
-        case "setPower":
-          await this.hc.setSetting(haId, "BSH.Common.Setting.PowerState",
-            plan.args.on ? "BSH.Common.EnumType.PowerState.On" : "BSH.Common.EnumType.PowerState.Off");
-          break;
-        case "startProgram":
-          await this.hc.startProgram(haId, plan.args.programKey, plan.args.options);
-          break;
-        case "stopProgram":
-          await this.hc.stopProgram(haId);
-          break;
+      if (plan.action === "powerOn") {
+        await this.hc.setSetting(haId, "BSH.Common.Setting.PowerState",
+          "BSH.Common.EnumType.PowerState.On");
+      } else if (plan.action === "powerOff") {
+        // Versuche zuerst Standby, dann Off
+        await this.hc.setSetting(haId, "BSH.Common.Setting.PowerState",
+          "BSH.Common.EnumType.PowerState.Standby")
+          .catch(() => this.hc.setSetting(haId, "BSH.Common.Setting.PowerState",
+            "BSH.Common.EnumType.PowerState.Off"));
       }
       this.hcu.sendControlResponse(true, null, correlationId);
     } catch (err) {
@@ -103,55 +109,47 @@ export class Bridge {
     }
   }
 
-  // ── Home Connect SSE Events ───────────────────────────────────────────────
-
   #wireSse() {
     this.sse.on("event", ({ type, haId, items }) => {
       if (!haId) return;
-      const deviceId = this.#lookupDeviceId(haId);
-      if (!deviceId) return;
+      const baseId = `hc-${haId}`;
+      if (!this.deviceToHaId.has(baseId)) return;
 
       switch (type) {
-        case "CONNECTED":    this.#pushGenericInput(deviceId, "operationState", "Online"); break;
-        case "DISCONNECTED": this.#pushGenericInput(deviceId, "operationState", "Offline"); break;
-        case "DEPAIRED":     this.#removeDevice(deviceId); break;
-        case "PAIRED":       this.#refreshAppliance(haId).catch((e) => log.warn(e)); break;
-        case "STATUS": case "EVENT": case "NOTIFY":
-          this.#applyUpdates(deviceId, items);
+        case "CONNECTED":
+          this.hcu.pushStatusEvent(baseId, [{ type: "switchState", on: true }]);
           break;
+        case "DISCONNECTED":
+          this.hcu.pushStatusEvent(baseId, [{ type: "switchState", on: false }]);
+          break;
+        case "DEPAIRED":
+          this.devices.delete(baseId);
+          this.devices.delete(`${baseId}-door`);
+          this.deviceToHaId.delete(baseId);
+          break;
+        case "PAIRED":
+          this.#refreshAppliance(haId).catch((e) => log.warn(e));
+          break;
+        case "STATUS": case "EVENT": case "NOTIFY": {
+          const events = itemsToStatusEvents(baseId, items);
+          for (const ev of events) {
+            // Device-Cache aktualisieren
+            const dev = this.devices.get(ev.deviceId);
+            if (dev) dev.features = ev.features;
+            this.hcu.pushStatusEvent(ev.deviceId, ev.features);
+          }
+          break;
+        }
       }
     });
   }
 
-  #applyUpdates(deviceId, items) {
-    const updates = itemsToFeatureUpdates(items);
-    if (updates.length === 0) return;
-
-    // Features zusammenführen und als STATUS_EVENT pushen
-    const features = updates.map(u => ({ type: u.featureType, ...u.props }));
-    this.hcu.pushStatusEvent(deviceId, features);
-  }
-
-  #pushGenericInput(deviceId, key, value) {
-    this.hcu.pushStatusEvent(deviceId, [{ type: "GENERIC_INPUT", key, value }]);
-  }
-
-  #lookupDeviceId(haId) {
-    for (const [devId, id] of this.deviceToHaId) if (id === haId) return devId;
-    return null;
-  }
-
-  #removeDevice(deviceId) {
-    this.devices.delete(deviceId);
-    this.deviceToHaId.delete(deviceId);
-  }
-
   async #refreshAppliance(haId) {
-    const app    = await this.hc.getAppliance(haId);
-    const device = applianceToDevice(app);
-    this.devices.set(device.id, device);
-    this.deviceToHaId.set(device.id, haId);
-    await this.#syncInitialState(haId, device.id);
+    const app  = await this.hc.getAppliance(haId);
+    const devs = applianceToDevices(app);
+    const baseId = `hc-${haId}`;
+    this.deviceToHaId.set(baseId, haId);
+    for (const d of devs) this.devices.set(d.deviceId, d);
     this.hcu.sendDiscoverResponse([...this.devices.values()], null);
   }
 }
